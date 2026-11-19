@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import cv2
 import math
 import os
+import traceback
 
 # ==========================================================
 # BLOQUE 1. LIBRERIAS Y VARIABLE PRINCIPAL
@@ -443,7 +444,8 @@ def recortar_marco_grafica(img):
 
     neutro_oscuro = ((chroma < 45) & (gris < 190)).astype(np.uint8) * 255
     bordes = cv2.dilate(neutro_oscuro, np.ones((3, 3), np.uint8), iterations=1)
-    contornos, _ = cv2.findContours(bordes, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    res_cnt = cv2.findContours(bordes, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contornos = res_cnt[0] if len(res_cnt) == 2 else res_cnt[1]
 
     mejor_caja = None
     mejor_area = 0
@@ -475,19 +477,28 @@ def recortar_marco_grafica(img):
 
 def _agrupar_indices(indices, pesos):
     """Agrupa filas o columnas adyacentes de una linea gruesa y devuelve su centro."""
-    if len(indices) == 0:
+    indices_arr = np.asarray(indices, dtype=np.int64)
+    if indices_arr.size == 0:
         return []
     grupos = []
     inicio = 0
-    for i in range(1, len(indices)):
-        if indices[i] - indices[i - 1] > 5:
-            seg = indices[inicio:i]
-            centro_g = int(np.round(np.average(seg, weights=pesos[seg])))
-            grupos.append((centro_g, float(np.max(pesos[seg]))))
+    for i in range(1, len(indices_arr)):
+        if int(indices_arr[i]) - int(indices_arr[i - 1]) > 5:
+            seg = indices_arr[inicio:i]
+            w_seg = pesos[seg]
+            if float(np.sum(w_seg)) > 0.0:
+                centro_g = int(np.round(np.average(seg, weights=w_seg)))
+            else:
+                centro_g = int(np.round(np.mean(seg)))
+            grupos.append((centro_g, float(np.max(w_seg))))
             inicio = i
-    seg = indices[inicio:]
-    centro_g = int(np.round(np.average(seg, weights=pesos[seg])))
-    grupos.append((centro_g, float(np.max(pesos[seg]))))
+    seg = indices_arr[inicio:]
+    w_seg = pesos[seg]
+    if float(np.sum(w_seg)) > 0.0:
+        centro_g = int(np.round(np.average(seg, weights=w_seg)))
+    else:
+        centro_g = int(np.round(np.mean(seg)))
+    grupos.append((centro_g, float(np.max(w_seg))))
     return grupos
 
 
@@ -524,27 +535,33 @@ def enderezar_y_detectar_ejes(roi):
 
     angulo_corr = 0.0
     if lineas is not None:
-        angulos_h = []
-        pesos_h = []
-        for l in lineas[:, 0]:
-            x1, y1, x2, y2 = l
-            if x2 < x1:
-                x1, y1, x2, y2 = x2, y2, x1, y1
-            dx = float(x2 - x1)
-            dy = float(y2 - y1)
-            largo = math.hypot(dx, dy)
-            ang = math.degrees(math.atan2(dy, dx))
-            if abs(ang) < 10.0 and largo > 0.22 * w:
-                angulos_h.append(ang)
-                pesos_h.append(largo)
+        lineas_arr = np.asarray(lineas)
+        if lineas_arr.size >= 4 and (lineas_arr.size % 4 == 0):
+            lineas_2d = lineas_arr.reshape(-1, 4)
+            angulos_h = []
+            pesos_h = []
+            for fila in lineas_2d:
+                x1 = int(fila[0])
+                y1 = int(fila[1])
+                x2 = int(fila[2])
+                y2 = int(fila[3])
+                if x2 < x1:
+                    x1, y1, x2, y2 = x2, y2, x1, y1
+                dx = float(x2 - x1)
+                dy = float(y2 - y1)
+                largo = math.hypot(dx, dy)
+                ang = math.degrees(math.atan2(dy, dx))
+                if abs(ang) < 10.0 and largo > 0.22 * w:
+                    angulos_h.append(ang)
+                    pesos_h.append(largo)
 
-        if angulos_h:
-            orden = np.argsort(angulos_h)
-            ang_ord = np.array(angulos_h)[orden]
-            pes_ord = np.array(pesos_h)[orden]
-            acum = np.cumsum(pes_ord)
-            idx_med = int(np.searchsorted(acum, 0.5 * acum[-1]))
-            angulo_corr = float(ang_ord[min(idx_med, len(ang_ord) - 1)])
+            if angulos_h:
+                orden = np.argsort(angulos_h)
+                ang_ord = np.array(angulos_h)[orden]
+                pes_ord = np.array(pesos_h)[orden]
+                acum = np.cumsum(pes_ord)
+                idx_med = int(np.searchsorted(acum, 0.5 * acum[-1]))
+                angulo_corr = float(ang_ord[min(idx_med, len(ang_ord) - 1)])
 
     if 0.25 < abs(angulo_corr) < 10.0:
         bg_bgr = np.median(roi.reshape(-1, 3), axis=0)
@@ -614,7 +631,8 @@ def eliminar_cajas_leyenda(roi, masc_curva):
     chroma = np.max(roi, axis=2).astype(np.int16) - np.min(roi, axis=2).astype(np.int16)
 
     borde_leyenda = ((chroma < 45) & (gris < 215)).astype(np.uint8) * 255
-    contornos, _ = cv2.findContours(borde_leyenda, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    res_cnt = cv2.findContours(borde_leyenda, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contornos = res_cnt[0] if len(res_cnt) == 2 else res_cnt[1]
 
     masc_limpia = masc_curva.copy()
     for cnt in contornos:
@@ -637,9 +655,10 @@ def _filtrar_texto_y_artefactos_componentes(masc, w, h):
     marcas pequeñas y rayitas verticales punteadas en discontinuidades,
     aprovechando que una funcion f(t) es univaluada en cada columna x.
     """
-    num_et, etiq, stats, _ = cv2.connectedComponentsWithStats(masc, connectivity=8)
+    masc_u8 = np.ascontiguousarray((masc > 0).astype(np.uint8) * 255)
+    num_et, etiq, stats, _ = cv2.connectedComponentsWithStats(masc_u8, connectivity=8)
     if num_et <= 1:
-        return masc
+        return masc_u8
 
     comps = []
     for i in range(1, num_et):
@@ -653,15 +672,16 @@ def _filtrar_texto_y_artefactos_componentes(masc, w, h):
         comps.append((i, x, y, cw, ch, area))
 
     if not comps:
-        return masc
+        return masc_u8
 
     comps.sort(key=lambda c: c[3], reverse=True)
 
     col_cubierta = np.zeros(w, dtype=bool)
     max_cw = comps[0][3]
-    masc_out = np.zeros_like(masc)
+    masc_out = np.zeros_like(masc_u8)
 
-    for i, x, y, cw, ch, area in comps:
+    for comp in comps:
+        i, x, y, cw, ch, area = comp
         es_trazo_vertical = (cw < max(14, int(0.024 * w))) and (ch > 1.7 * cw)
         if es_trazo_vertical:
             continue
@@ -679,7 +699,7 @@ def _filtrar_texto_y_artefactos_componentes(masc, w, h):
             col_cubierta[x:x + cw] = True
 
     if np.sum(masc_out > 0) < 40:
-        return masc
+        return masc_u8
 
     return masc_out
 
@@ -722,7 +742,9 @@ def extraer_mascara_curva(roi, x0, y0):
 
         hist_bins.sort(key=lambda b: (b[1], b[2]), reverse=True)
         hues_validos = [hist_bins[0][0]]
-        for centro_h, ancho_cov, _ in hist_bins[1:]:
+        for item_bin in hist_bins[1:]:
+            centro_h = item_bin[0]
+            ancho_cov = item_bin[1]
             if ancho_cov >= 0.14:
                 if all(min(abs(centro_h - hv), 180 - abs(centro_h - hv)) >= 25 for hv in hues_validos):
                     hues_validos.append(centro_h)
@@ -759,17 +781,23 @@ def extraer_mascara_curva(roi, x0, y0):
 
 
 def _mediana_movil_1d(arr, k=5):
-    """Suavizado por mediana 1D (elimina picos de 1-2 px sin redondear saltos)."""
+    """Suavizado por mediana 1D compatible con cualquier version de NumPy."""
+    arr_f = np.asarray(arr, dtype=np.float64)
+    n_pts = len(arr_f)
+    if n_pts < k:
+        return arr_f.copy()
     pad = k // 2
-    ext = np.pad(arr, pad, mode="edge")
-    ventanas = np.lib.stride_tricks.sliding_window_view(ext, k)
-    return np.median(ventanas, axis=1)
+    ext = np.pad(arr_f, pad, mode="edge")
+    pilas = np.vstack([ext[i:i + n_pts] for i in range(k)])
+    return np.median(pilas, axis=0)
 
 
 def extraer_senal_1d_imagen(masc_curva, x0, y0, modo_extraccion):
     """
     Convierte la mascara 2D de la curva en una senal 1D y(x) limpia y uniforme.
     """
+    if masc_curva.ndim == 3:
+        masc_curva = masc_curva[:, :, 0]
     h, w = masc_curva.shape[:2]
 
     ys_globales, xs_globales = np.where(masc_curva > 0)
@@ -816,12 +844,12 @@ def extraer_senal_1d_imagen(masc_curva, x0, y0, modo_extraccion):
         sub_interp = np.interp(np.arange(n_sub), idx_val, sub_trazo[idx_val])
 
         if modo_extraccion == "monocromo":
-            cambios = np.diff(np.concatenate(([0], es_nan.astype(int), [0])))
+            cambios = np.diff(np.concatenate(([0], es_nan.astype(np.int64), [0])))
             inicios_nan = np.where(cambios == 1)[0]
             fines_nan = np.where(cambios == -1)[0]
             for a_idx, b_idx in zip(inicios_nan, fines_nan):
-                if (b_idx - a_idx) > max(14, int(0.06 * n_sub)):
-                    sub_interp[a_idx:b_idx] = 0.0
+                if (int(b_idx) - int(a_idx)) > max(14, int(0.06 * n_sub)):
+                    sub_interp[int(a_idx):int(b_idx)] = 0.0
 
         sub_trazo = sub_interp
 
@@ -1073,6 +1101,7 @@ def ejecutar_reconocimiento_por_imagen():
         clasificacion, metricas, _ = clasificar_simetria_imagen(y_norm, idx_x0)
     except Exception as err:
         print(f"\nError al procesar la imagen: {err}")
+        traceback.print_exc()
         return
 
     sim_par = max(0.0, (1.0 - metricas["par"]) * 100.0)
