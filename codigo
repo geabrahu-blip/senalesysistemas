@@ -1,0 +1,2301 @@
+import sympy as sp
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import math
+import os
+
+# ==========================================================
+# BLOQUE 1. LIBRERIAS Y VARIABLE PRINCIPAL
+# ==========================================================
+
+t = sp.symbols('t', real=True)
+
+
+# ==========================================================
+# BLOQUE 2. FUNCIONES AUXILIARES
+# ==========================================================
+
+def leer_numero(texto):
+    """
+    Permite ingresar enteros, decimales, fracciones y valores
+    simbólicos como pi.
+    """
+    try:
+        return sp.Rational(texto)
+    except Exception:
+        return sp.sympify(texto)
+
+
+def obtener_variable(expresion):
+    """Obtiene la variable que realmente pertenece a la expresión."""
+    simbolos = list(expresion.free_symbols)
+
+    if len(simbolos) == 0:
+        return None
+
+    for simbolo in simbolos:
+        if str(simbolo) == "t":
+            return simbolo
+
+    if len(simbolos) == 1:
+        return simbolos[0]
+
+    return simbolos[0]
+
+
+def simplificar(expr):
+    """Simplificación simbólica exacta."""
+    return sp.factor(
+        sp.cancel(
+            sp.simplify(expr)
+        )
+    )
+
+
+def son_iguales(valor_1, valor_2):
+    """Comprueba igualdad simbólica entre dos valores."""
+    return sp.simplify(valor_1 - valor_2) == 0
+
+
+def reconstruir_tramos(tramos_base, tipo, centro, mitad, cuarto):
+    """
+    Reconstruye un periodo completo a partir del primer medio
+    periodo (opciones 1 a 3) o del cuarto de referencia (4 y 5),
+    según la simetría seleccionada.
+
+    Los tramos se representan como:
+        (expresion, limite_inferior, limite_superior)
+    """
+    tramos_completos = []
+
+    if tipo == 1:
+        for expresion, a, b in tramos_base:
+            tramos_completos.append((expresion, a, b))
+            expresion_reflejada = expresion.subs(t, 2 * centro - t)
+
+            tramos_completos.append((
+                expresion_reflejada,
+                2 * centro - b,
+                2 * centro - a
+            ))
+
+    elif tipo == 2:
+        for expresion, a, b in tramos_base:
+            tramos_completos.append((expresion, a, b))
+            expresion_reflejada = -expresion.subs(t, 2 * centro - t)
+
+            tramos_completos.append((
+                expresion_reflejada,
+                2 * centro - b,
+                2 * centro - a
+            ))
+
+    elif tipo == 3:
+        for expresion, a, b in tramos_base:
+            tramos_completos.append((expresion, a, b))
+            expresion_desplazada = -expresion.subs(t, t - mitad)
+            tramos_completos.append((
+                expresion_desplazada,
+                a + mitad,
+                b + mitad
+            ))
+
+    elif tipo == 4:
+        for expresion, a, b in tramos_base:
+            tramos_completos.append((expresion, a, b))
+            expresion_segundo = -expresion.subs(t, 2 * centro + mitad - t)
+
+            tramos_completos.append((
+                expresion_segundo,
+                2 * centro + mitad - b,
+                2 * centro + mitad - a
+            ))
+            expresion_tercero = expresion.subs(t, 2 * centro - t)
+
+            tramos_completos.append((
+                expresion_tercero,
+                2 * centro - b,
+                2 * centro - a
+            ))
+            expresion_cuarto = -expresion.subs(t, t + mitad)
+            tramos_completos.append((
+                expresion_cuarto,
+                a - mitad,
+                b - mitad
+            ))
+
+    elif tipo == 5:
+        for expresion, a, b in tramos_base:
+            tramos_completos.append((expresion, a, b))
+            expresion_segundo = expresion.subs(t, 2 * centro + mitad - t)
+
+            tramos_completos.append((
+                expresion_segundo,
+                2 * centro + mitad - b,
+                2 * centro + mitad - a
+            ))
+            expresion_tercero = -expresion.subs(t, 2 * centro - t)
+
+            tramos_completos.append((
+                expresion_tercero,
+                2 * centro - b,
+                2 * centro - a
+            ))
+            expresion_cuarto = -expresion.subs(t, t + mitad)
+            tramos_completos.append((
+                expresion_cuarto,
+                a - mitad,
+                b - mitad
+            ))
+
+    tramos_completos.sort(key=lambda tramo: float(tramo[1]))
+    return tramos_completos
+
+
+def forzar_simetria_completa(tramos_originales, tipo, inicio, final, centro=None, mitad=None):
+    """
+    Construye una señal con la simetría deseada tomando TODA la señal
+    original ingresada en [inicio, final] como bloque generador, sin
+    borrar ni promediar destructivamente ninguno de sus tramos:
+
+    - Tipo 1 (Par): La señal original en [inicio, final] es la mitad derecha.
+      Se refleja de forma par hacia [inicio - L, inicio] respecto a t = inicio.
+      Nuevo periodo: T = 2*L, eje de simetría: t_eje = inicio.
+
+    - Tipo 2 (Impar): La señal original en [inicio, final] es la mitad derecha.
+      Se refleja e invierte hacia [inicio - L, inicio] respecto a t = inicio.
+      Nuevo periodo: T = 2*L, eje de simetría: t_eje = inicio.
+
+    - Tipo 3 (Media onda): La señal original en [inicio, final] es el primer
+      medio periodo. El segundo medio periodo en [final, final + L] se obtiene
+      desplazando L e invirtiendo el signo: -f(t - L).
+      Nuevo periodo: T = 2*L, eje de referencia: t_eje = inicio.
+
+    - Tipo 4 (Cuarto de onda Par): La señal original en [inicio, final] es el
+      primer cuarto de periodo (T/4 = L -> T = 4*L).
+      Cuarto 1 [inicio, inicio + L]: f(t) (Original, simétrica par respecto a inicio)
+      Cuarto 2 [inicio + L, inicio + 2L]: -f(2*final - t) (Antisimétrica en T/4)
+      Cuarto 3 [inicio + 2L, inicio + 3L]: -f(t - 2L) (Media onda del Cuarto 1)
+      Cuarto 4 [inicio + 3L, inicio + 4L]: +f(4*final - 3*inicio - t) (Media onda del Cuarto 2)
+      Así cumple simultáneamente f(inicio - x) = f(inicio + x) y f(t + T/2) = -f(t).
+
+    - Tipo 5 (Cuarto de onda Impar): La señal original en [inicio, final] es el
+      primer cuarto de periodo (T/4 = L -> T = 4*L).
+      Cuarto 1 [inicio, inicio + L]: f(t) (Original)
+      Cuarto 2 [inicio + L, inicio + 2L]: +f(2*final - t) (Simétrica par en T/4)
+      Cuarto 3 [inicio + 2L, inicio + 3L]: -f(t - 2L) (Media onda del Cuarto 1)
+      Cuarto 4 [inicio + 3L, inicio + 4L]: -f(4*final - 3*inicio - t) (Media onda del Cuarto 2)
+      Así cumple simultáneamente f(inicio - x) = -f(inicio + x) y f(t + T/2) = -f(t).
+    """
+    L = simplificar(final - inicio)
+    tramos_resultado = []
+    tramos_detalle = []  # (expresion, a, b, etiqueta_bloque)
+
+    if tipo == 1:
+        # Simetría Par respecto a t = inicio -> Periodo [inicio - L, final]
+        nuevo_t_min = simplificar(inicio - L)
+        nuevo_t_max = simplificar(final)
+        t_eje = simplificar(inicio)
+
+        for expr, a, b in tramos_originales:
+            # Tramo original (mitad derecha)
+            tramos_detalle.append((sp.simplify(expr), simplificar(a), simplificar(b), "Original (Mitad derecha)"))
+            # Tramo reflejado par respecto a 'inicio': t -> 2*inicio - t
+            expr_ref = sp.simplify(expr.subs(t, 2 * inicio - t))
+            a_ref = simplificar(2 * inicio - b)
+            b_ref = simplificar(2 * inicio - a)
+            tramos_detalle.append((expr_ref, a_ref, b_ref, "Reflejo Par (Mitad izquierda)"))
+
+    elif tipo == 2:
+        # Simetría Impar respecto a t = inicio -> Periodo [inicio - L, final]
+        nuevo_t_min = simplificar(inicio - L)
+        nuevo_t_max = simplificar(final)
+        t_eje = simplificar(inicio)
+
+        for expr, a, b in tramos_originales:
+            # Tramo original (mitad derecha)
+            tramos_detalle.append((sp.simplify(expr), simplificar(a), simplificar(b), "Original (Mitad derecha)"))
+            # Tramo reflejado impar respecto a 'inicio': -f(2*inicio - t)
+            expr_ref = sp.simplify(-expr.subs(t, 2 * inicio - t))
+            a_ref = simplificar(2 * inicio - b)
+            b_ref = simplificar(2 * inicio - a)
+            tramos_detalle.append((expr_ref, a_ref, b_ref, "Reflejo Impar (Mitad izquierda)"))
+
+    elif tipo == 3:
+        # Simetría de Media Onda -> Periodo [inicio, inicio + 2*L]
+        nuevo_t_min = simplificar(inicio)
+        nuevo_t_max = simplificar(inicio + 2 * L)
+        t_eje = simplificar(inicio)
+
+        for expr, a, b in tramos_originales:
+            # Primer medio periodo (original)
+            tramos_detalle.append((sp.simplify(expr), simplificar(a), simplificar(b), "Original (1er Medio Periodo)"))
+            # Segundo medio periodo: desplazado L e invertido -f(t - L)
+            expr_mw = sp.simplify(-expr.subs(t, t - L))
+            a_mw = simplificar(a + L)
+            b_mw = simplificar(b + L)
+            tramos_detalle.append((expr_mw, a_mw, b_mw, "Media Onda -f(t - T/2) (2do Medio Periodo)"))
+
+    elif tipo == 4:
+        # Simetría de Cuarto de Onda Par -> Periodo [inicio, inicio + 4*L]
+        # Eje par en t = inicio (solo cosenos impares)
+        nuevo_t_min = simplificar(inicio)
+        nuevo_t_max = simplificar(inicio + 4 * L)
+        t_eje = simplificar(inicio)
+
+        for expr, a, b in tramos_originales:
+            # 1er Cuarto [inicio, inicio + L]: Original
+            tramos_detalle.append((sp.simplify(expr), simplificar(a), simplificar(b), "1er Cuarto (Original)"))
+
+            # 2do Cuarto [inicio + L, inicio + 2L]: Reflexión impar respecto a t = final (T/4)
+            expr_q2 = sp.simplify(-expr.subs(t, 2 * final - t))
+            a_q2 = simplificar(2 * final - b)
+            b_q2 = simplificar(2 * final - a)
+            tramos_detalle.append((expr_q2, a_q2, b_q2, "2do Cuarto (Antisimétrico en T/4)"))
+
+            # 3er Cuarto [inicio + 2L, inicio + 3L]: Media onda del 1er cuarto -> -f(t - 2L)
+            expr_q3 = sp.simplify(-expr.subs(t, t - 2 * L))
+            a_q3 = simplificar(a + 2 * L)
+            b_q3 = simplificar(b + 2 * L)
+            tramos_detalle.append((expr_q3, a_q3, b_q3, "3er Cuarto (Media onda Q1)"))
+
+            # 4to Cuarto [inicio + 3L, inicio + 4L]: Media onda del 2do cuarto -> +f(2*final - (t - 2L))
+            expr_q4 = sp.simplify(expr.subs(t, 2 * final + 2 * L - t))
+            a_q4 = simplificar(2 * final + 2 * L - b)
+            b_q4 = simplificar(2 * final + 2 * L - a)
+            tramos_detalle.append((expr_q4, a_q4, b_q4, "4to Cuarto (Reflejo Par en T)"))
+
+    elif tipo == 5:
+        # Simetría de Cuarto de Onda Impar -> Periodo [inicio, inicio + 4*L]
+        # Eje impar en t = inicio (solo senos impares)
+        nuevo_t_min = simplificar(inicio)
+        nuevo_t_max = simplificar(inicio + 4 * L)
+        t_eje = simplificar(inicio)
+
+        for expr, a, b in tramos_originales:
+            # 1er Cuarto [inicio, inicio + L]: Original
+            tramos_detalle.append((sp.simplify(expr), simplificar(a), simplificar(b), "1er Cuarto (Original)"))
+
+            # 2do Cuarto [inicio + L, inicio + 2L]: Reflexión par respecto a t = final (T/4)
+            expr_q2 = sp.simplify(expr.subs(t, 2 * final - t))
+            a_q2 = simplificar(2 * final - b)
+            b_q2 = simplificar(2 * final - a)
+            tramos_detalle.append((expr_q2, a_q2, b_q2, "2do Cuarto (Simétrico en T/4)"))
+
+            # 3er Cuarto [inicio + 2L, inicio + 3L]: Media onda del 1er cuarto -> -f(t - 2L)
+            expr_q3 = sp.simplify(-expr.subs(t, t - 2 * L))
+            a_q3 = simplificar(a + 2 * L)
+            b_q3 = simplificar(b + 2 * L)
+            tramos_detalle.append((expr_q3, a_q3, b_q3, "3er Cuarto (Media onda Q1)"))
+
+            # 4to Cuarto [inicio + 3L, inicio + 4L]: Media onda del 2do cuarto -> -f(2*final + 2L - t)
+            expr_q4 = sp.simplify(-expr.subs(t, 2 * final + 2 * L - t))
+            a_q4 = simplificar(2 * final + 2 * L - b)
+            b_q4 = simplificar(2 * final + 2 * L - a)
+            tramos_detalle.append((expr_q4, a_q4, b_q4, "4to Cuarto (Reflejo Impar en T)"))
+    else:
+        raise ValueError("Tipo de simetria no valido para forzar la senal.")
+
+    tramos_detalle.sort(key=lambda item: float(item[1]))
+    tramos_resultado = [(expr, a, b) for expr, a, b, _ in tramos_detalle]
+
+    return tramos_resultado, tramos_detalle, nuevo_t_min, nuevo_t_max, t_eje
+
+
+def validar_tramos_base(tramos_base, inicio, final):
+    """Comprueba que los tramos cubran sin huecos el intervalo solicitado."""
+    if len(tramos_base) == 0:
+        return False, "No se ingreso ningun tramo."
+
+    tramos_ordenados = sorted(
+        tramos_base,
+        key=lambda tramo: float(tramo[1])
+    )
+
+    if not son_iguales(tramos_ordenados[0][1], inicio):
+        return False, f"El primer tramo debe comenzar en {inicio}."
+
+    for i in range(len(tramos_ordenados) - 1):
+        limite_actual = tramos_ordenados[i][2]
+        limite_siguiente = tramos_ordenados[i + 1][1]
+
+        if not son_iguales(limite_actual, limite_siguiente):
+            return False, (
+                "Hay un espacio o una superposicion entre dos tramos. "
+                f"El limite esperado es {limite_actual}, "
+                f"pero el siguiente comienza en {limite_siguiente}."
+            )
+
+    if not son_iguales(tramos_ordenados[-1][2], final):
+        return False, f"El ultimo tramo debe terminar en {final}."
+
+    for expresion, a, b in tramos_ordenados:
+        if float(b) <= float(a):
+            return False, "Cada tramo debe tener limite inferior menor que limite superior."
+
+    return True, "Tramos correctos."
+
+
+def extraer_tramos_intervalo(tramos_completos, inicio, final):
+    """Extrae de una senal completa los tramos que pertenecen a un intervalo."""
+    resultado = []
+
+    for expresion, a, b in tramos_completos:
+        nuevo_a = inicio if float(a) < float(inicio) else a
+        nuevo_b = final if float(b) > float(final) else b
+
+        if float(nuevo_b) > float(nuevo_a):
+            resultado.append((expresion, nuevo_a, nuevo_b))
+
+    resultado.sort(key=lambda tramo: float(tramo[1]))
+    return resultado
+
+
+def evaluar_funcion(funcion, puntos):
+    """Evalua una funcion y garantiza un vector del mismo largo que puntos."""
+    valores = np.asarray(funcion(puntos))
+
+    if valores.ndim == 0:
+        valores = np.full_like(
+            puntos,
+            valores,
+            dtype=np.result_type(valores, float)
+        )
+
+    return np.real(valores)
+
+
+# ==========================================================
+# BLOQUE 2B. DETECTOR UNIVERSAL DE SIMETRIAS POR IMAGEN (OPENCV)
+# ==========================================================
+
+def seleccionar_ruta_imagen():
+    """Abre el selector de archivos de Windows; si se cancela, pide la ruta por consola."""
+    ruta = ""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        raiz = tk.Tk()
+        raiz.withdraw()
+        raiz.attributes("-topmost", True)
+        ruta = filedialog.askopenfilename(
+            title="Seleccione la imagen de la señal",
+            filetypes=[
+                ("Imágenes", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"),
+                ("Todos los archivos", "*.*")
+            ]
+        )
+        raiz.destroy()
+    except Exception:
+        ruta = ""
+
+    if not ruta:
+        ruta = input("Ingrese o arrastre aqui la ruta de la imagen: ").strip().strip('"').strip("'")
+
+    return ruta
+
+
+def cargar_imagen_segura(ruta):
+    """
+    Carga imagenes incluso si la ruta tiene tildes, espacios o ñ en Windows,
+    y maneja PNGs con fondo transparente (canal alfa) y modo oscuro.
+    """
+    ruta_limpia = ruta.strip().strip('"').strip("'")
+    if not os.path.isfile(ruta_limpia):
+        raise FileNotFoundError(f"No se encontro el archivo: {ruta_limpia}")
+
+    datos = np.fromfile(ruta_limpia, dtype=np.uint8)
+    img = cv2.imdecode(datos, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("No se pudo decodificar la imagen. Verifica el formato.")
+
+    if img.ndim == 3 and img.shape[2] == 4:
+        bgr = img[:, :, :3].astype(np.float32)
+        alfa = img[:, :, 3:4].astype(np.float32) / 255.0
+        fondo = np.full_like(bgr, 255.0)
+        img = (bgr * alfa + fondo * (1.0 - alfa)).astype(np.uint8)
+    elif img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    gris_tmp = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if np.median(gris_tmp) < 120:
+        img = 255 - img
+
+    h, w = img.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > 1400:
+        escala = 1400.0 / max_dim
+        img = cv2.resize(img, (int(w * escala), int(h * escala)), interpolation=cv2.INTER_AREA)
+
+    return img
+
+
+def recortar_marco_grafica(img):
+    """
+    Si la imagen tiene un recuadro rectangular externo (Matplotlib, MATLAB, Excel),
+    recorta su interior para eliminar numeros de ejes y titulos externos.
+    """
+    h, w = img.shape[:2]
+    area_img = h * w
+    gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    chroma = np.max(img, axis=2).astype(np.int16) - np.min(img, axis=2).astype(np.int16)
+
+    neutro_oscuro = ((chroma < 45) & (gris < 190)).astype(np.uint8) * 255
+    bordes = cv2.dilate(neutro_oscuro, np.ones((3, 3), np.uint8), iterations=1)
+    contornos, _ = cv2.findContours(bordes, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    mejor_caja = None
+    mejor_area = 0
+
+    for cnt in contornos:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        area_caja = cw * ch
+        if 0.20 * area_img < area_caja < 0.96 * area_img:
+            if cw > 0.35 * w and ch > 0.25 * h:
+                borde_sup = np.mean(neutro_oscuro[y:min(h, y + 4), x:x + cw] > 0)
+                borde_inf = np.mean(neutro_oscuro[max(0, y + ch - 4):y + ch, x:x + cw] > 0)
+                borde_izq = np.mean(neutro_oscuro[y:y + ch, x:min(w, x + 4)] > 0)
+                borde_der = np.mean(neutro_oscuro[y:y + ch, max(0, x + cw - 4):x + cw] > 0)
+
+                if borde_sup > 0.70 and borde_inf > 0.70 and borde_izq > 0.70 and borde_der > 0.70:
+                    if area_caja > mejor_area:
+                        mejor_area = area_caja
+                        mejor_caja = (x, y, cw, ch)
+
+    if mejor_caja is not None:
+        x, y, cw, ch = mejor_caja
+        margen = max(3, int(0.008 * min(cw, ch)))
+        roi = img[y + margen:y + ch - margen, x + margen:x + cw - margen]
+        if roi.size > 0:
+            return roi, True
+
+    return img.copy(), False
+
+
+def _agrupar_indices(indices, pesos):
+    """Agrupa filas o columnas adyacentes de una linea gruesa y devuelve su centro."""
+    if len(indices) == 0:
+        return []
+    grupos = []
+    inicio = 0
+    for i in range(1, len(indices)):
+        if indices[i] - indices[i - 1] > 5:
+            seg = indices[inicio:i]
+            centro_g = int(np.round(np.average(seg, weights=pesos[seg])))
+            grupos.append((centro_g, float(np.max(pesos[seg]))))
+            inicio = i
+    seg = indices[inicio:]
+    centro_g = int(np.round(np.average(seg, weights=pesos[seg])))
+    grupos.append((centro_g, float(np.max(pesos[seg]))))
+    return grupos
+
+
+def _mascara_tinta_neutra(roi, factor_oscuro=0.72, max_chroma=52):
+    """
+    Detecta lineas negras/gris oscuro incluso sobre fondos amarillentos o crema,
+    usando croma (max-min de BGR) en lugar de saturacion HSV.
+    """
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    bg_gris = float(np.percentile(gris, 85))
+    chroma = np.max(roi, axis=2).astype(np.int16) - np.min(roi, axis=2).astype(np.int16)
+    umbral_g = min(155.0, bg_gris * factor_oscuro)
+    return ((chroma < max_chroma) & (gris < umbral_g)).astype(np.uint8) * 255
+
+
+def enderezar_y_detectar_ejes(roi):
+    """
+    1) Usa Transformada de Hough sobre las lineas oscuras neutras para detectar
+       si la imagen/foto tiene una ligera inclinacion (hasta ±10°) y la endereza.
+    2) Localiza con precision las coordenadas en pixeles (x0, y0) de los ejes
+       vertical (t = 0) y horizontal (y = 0).
+    """
+    h, w = roi.shape[:2]
+    masc_negro = _mascara_tinta_neutra(roi, factor_oscuro=0.72, max_chroma=52)
+
+    lineas = cv2.HoughLinesP(
+        masc_negro,
+        rho=1,
+        theta=np.pi / 360.0,
+        threshold=max(40, int(0.18 * min(h, w))),
+        minLineLength=max(40, int(0.22 * w)),
+        maxLineGap=max(12, int(0.04 * w))
+    )
+
+    angulo_corr = 0.0
+    if lineas is not None:
+        angulos_h = []
+        pesos_h = []
+        for l in lineas[:, 0]:
+            x1, y1, x2, y2 = l
+            if x2 < x1:
+                x1, y1, x2, y2 = x2, y2, x1, y1
+            dx = float(x2 - x1)
+            dy = float(y2 - y1)
+            largo = math.hypot(dx, dy)
+            ang = math.degrees(math.atan2(dy, dx))
+            if abs(ang) < 10.0 and largo > 0.22 * w:
+                angulos_h.append(ang)
+                pesos_h.append(largo)
+
+        if angulos_h:
+            orden = np.argsort(angulos_h)
+            ang_ord = np.array(angulos_h)[orden]
+            pes_ord = np.array(pesos_h)[orden]
+            acum = np.cumsum(pes_ord)
+            idx_med = int(np.searchsorted(acum, 0.5 * acum[-1]))
+            angulo_corr = float(ang_ord[min(idx_med, len(ang_ord) - 1)])
+
+    if 0.25 < abs(angulo_corr) < 10.0:
+        bg_bgr = np.median(roi.reshape(-1, 3), axis=0)
+        M_rot = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angulo_corr, 1.0)
+        roi = cv2.warpAffine(
+            roi,
+            M_rot,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(int(bg_bgr[0]), int(bg_bgr[1]), int(bg_bgr[2]))
+        )
+
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    x0_detectado = None
+    y0_detectado = None
+
+    for factor_osc in (0.62, 0.78):
+        masc_eje = (_mascara_tinta_neutra(roi, factor_oscuro=factor_osc, max_chroma=52) > 0).astype(np.uint8)
+
+        ker_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(11, w // 35), 1))
+        ker_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(11, h // 35)))
+        masc_h = cv2.morphologyEx(masc_eje, cv2.MORPH_CLOSE, ker_h)
+        masc_v = cv2.morphologyEx(masc_eje, cv2.MORPH_CLOSE, ker_v)
+
+        if y0_detectado is None:
+            cobertura_h = np.mean(masc_h > 0, axis=1)
+            intensidad_h = np.mean((255.0 - gris) * masc_eje, axis=1)
+            margen_y = max(3, int(0.03 * h))
+            cand_y = np.where(cobertura_h[margen_y:h - margen_y] > 0.35)[0] + margen_y
+            grupos_y = _agrupar_indices(cand_y, cobertura_h * (intensidad_h + 1.0))
+
+            if 1 <= len(grupos_y) <= 3:
+                grupos_y.sort(key=lambda g: g[1], reverse=True)
+                y0_detectado = grupos_y[0][0]
+            elif len(grupos_y) > 3:
+                grupos_y.sort(key=lambda g: g[1], reverse=True)
+                if grupos_y[0][1] > 1.35 * grupos_y[1][1]:
+                    y0_detectado = grupos_y[0][0]
+
+        if x0_detectado is None:
+            cobertura_v = np.mean(masc_v > 0, axis=0)
+            intensidad_v = np.mean((255.0 - gris) * masc_eje, axis=0)
+            margen_x = max(2, int(0.02 * w))
+            cand_x = np.where(cobertura_v[margen_x:w - margen_x] > 0.30)[0] + margen_x
+            grupos_x = _agrupar_indices(cand_x, cobertura_v * (intensidad_v + 1.0))
+
+            if 1 <= len(grupos_x) <= 3:
+                grupos_x.sort(key=lambda g: g[1], reverse=True)
+                x0_detectado = grupos_x[0][0]
+            elif len(grupos_x) > 3:
+                grupos_x.sort(key=lambda g: g[1], reverse=True)
+                if grupos_x[0][1] > 1.35 * grupos_x[1][1]:
+                    x0_detectado = grupos_x[0][0]
+
+        if x0_detectado is not None and y0_detectado is not None:
+            break
+
+    return roi, x0_detectado, y0_detectado, angulo_corr
+
+
+def eliminar_cajas_leyenda(roi, masc_curva):
+    """Descarta posibles recuadros de leyenda en las esquinas de la grafica."""
+    h, w = roi.shape[:2]
+    area_roi = h * w
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    chroma = np.max(roi, axis=2).astype(np.int16) - np.min(roi, axis=2).astype(np.int16)
+
+    borde_leyenda = ((chroma < 45) & (gris < 215)).astype(np.uint8) * 255
+    contornos, _ = cv2.findContours(borde_leyenda, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    masc_limpia = masc_curva.copy()
+    for cnt in contornos:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        area = cw * ch
+        if 0.008 * area_roi < area < 0.18 * area_roi:
+            perimetro = cv2.arcLength(cnt, True)
+            aprox = cv2.approxPolyDP(cnt, 0.04 * perimetro, True)
+            if len(aprox) == 4 and cw > 30 and ch > 18:
+                en_borde = (x < 0.25 * w or x + cw > 0.75 * w) and (y < 0.30 * h or y + ch > 0.70 * h)
+                if en_borde:
+                    masc_limpia[max(0, y - 2):min(h, y + ch + 2), max(0, x - 2):min(w, x + cw + 2)] = 0
+
+    return masc_limpia
+
+
+def _filtrar_texto_y_artefactos_componentes(masc, w, h):
+    """
+    Elimina etiquetas del mismo color que la curva (ej. 'f(t)', 't', numeros),
+    marcas pequeñas y rayitas verticales punteadas en discontinuidades,
+    aprovechando que una funcion f(t) es univaluada en cada columna x.
+    """
+    num_et, etiq, stats, _ = cv2.connectedComponentsWithStats(masc, connectivity=8)
+    if num_et <= 1:
+        return masc
+
+    comps = []
+    for i in range(1, num_et):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < 20:
+            continue
+        comps.append((i, x, y, cw, ch, area))
+
+    if not comps:
+        return masc
+
+    comps.sort(key=lambda c: c[3], reverse=True)
+
+    col_cubierta = np.zeros(w, dtype=bool)
+    max_cw = comps[0][3]
+    masc_out = np.zeros_like(masc)
+
+    for i, x, y, cw, ch, area in comps:
+        es_trazo_vertical = (cw < max(14, int(0.024 * w))) and (ch > 1.7 * cw)
+        if es_trazo_vertical:
+            continue
+
+        if cw < max(24, int(0.08 * w)) and cw < 0.70 * max_cw:
+            solapamiento = float(np.mean(col_cubierta[x:x + cw]))
+            if solapamiento > 0.35:
+                continue
+
+        if cw < max(10, int(0.018 * w)) and ch < max(10, int(0.025 * h)) and area < 55:
+            continue
+
+        masc_out[etiq == i] = 255
+        if cw >= max(18, int(0.045 * w)):
+            col_cubierta[x:x + cw] = True
+
+    if np.sum(masc_out > 0) < 40:
+        return masc
+
+    return masc_out
+
+
+def extraer_mascara_curva(roi, x0, y0):
+    """
+    Aisla la curva principal descartando ejes, cuadriculas, fondos crema,
+    destellos/marcas de otro color y etiquetas del mismo color (como 'f(t)').
+    """
+    h, w = roi.shape[:2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    bg_bgr = np.median(roi.reshape(-1, 3), axis=0).astype(np.float32)
+    bg_chroma = float(np.max(bg_bgr) - np.min(bg_bgr))
+    chroma = np.max(roi, axis=2).astype(np.float32) - np.min(roi, axis=2).astype(np.float32)
+    dist_bg = np.linalg.norm(roi.astype(np.float32) - bg_bgr, axis=2)
+
+    # --- ESTRATEGIA A: CURVA DE COLOR ---
+    masc_col_raw = (
+        (chroma > max(40.0, bg_chroma + 22.0))
+        & (hsv[:, :, 1] > 55)
+        & (hsv[:, :, 2] < 245)
+        & (dist_bg > 45.0)
+    )
+    masc_col_u8 = eliminar_cajas_leyenda(roi, masc_col_raw.astype(np.uint8) * 255)
+    masc_col_raw = masc_col_u8 > 0
+
+    cols_color = np.where(np.any(masc_col_raw, axis=0))[0]
+    if len(cols_color) > 0.22 * w:
+        h_canal = hsv[:, :, 0].astype(np.int16)
+        hist_bins = []
+        for centro_h in range(5, 180, 10):
+            dh = np.abs(h_canal - centro_h)
+            dh = np.minimum(dh, 180 - dh)
+            m_bin = masc_col_raw & (dh <= 16)
+            cols_bin = np.where(np.any(m_bin, axis=0))[0]
+            ancho_cov = len(cols_bin) / float(w)
+            hist_bins.append((centro_h, ancho_cov, int(np.sum(m_bin))))
+
+        hist_bins.sort(key=lambda b: (b[1], b[2]), reverse=True)
+        hues_validos = [hist_bins[0][0]]
+        for centro_h, ancho_cov, _ in hist_bins[1:]:
+            if ancho_cov >= 0.14:
+                if all(min(abs(centro_h - hv), 180 - abs(centro_h - hv)) >= 25 for hv in hues_validos):
+                    hues_validos.append(centro_h)
+
+        masc_hue = np.zeros((h, w), dtype=bool)
+        for hv in hues_validos:
+            dh = np.abs(h_canal - hv)
+            dh = np.minimum(dh, 180 - dh)
+            masc_hue |= (masc_col_raw & (dh <= 18))
+
+        masc_filtrada = _filtrar_texto_y_artefactos_componentes(masc_hue.astype(np.uint8) * 255, w, h)
+        if np.sum(masc_filtrada > 0) > 40:
+            return masc_filtrada, "color"
+
+    # --- ESTRATEGIA B: CURVA EN BLANCO Y NEGRO ---
+    tam_k = max(15, (min(h, w) // 18) | 1)
+    fondo = cv2.morphologyEx(gris, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tam_k, tam_k)))
+    dif = cv2.subtract(fondo, gris)
+
+    p99 = np.percentile(dif, 99.5)
+    umbral_tinta = max(35, int(0.35 * p99))
+    masc_bn = (dif > umbral_tinta).astype(np.uint8) * 255
+    masc_bn = eliminar_cajas_leyenda(roi, masc_bn)
+
+    masc_sin_ejes = masc_bn.copy()
+    banda = max(3, int(0.009 * min(h, w)))
+    if y0 is not None:
+        masc_sin_ejes[max(0, y0 - banda):min(h, y0 + banda + 1), :] = 0
+    if x0 is not None:
+        masc_sin_ejes[:, max(0, x0 - banda):min(w, x0 + banda + 1)] = 0
+
+    masc_limpia = _filtrar_texto_y_artefactos_componentes(masc_sin_ejes, w, h)
+    return masc_limpia, "monocromo"
+
+
+def _mediana_movil_1d(arr, k=5):
+    """Suavizado por mediana 1D (elimina picos de 1-2 px sin redondear saltos)."""
+    pad = k // 2
+    ext = np.pad(arr, pad, mode="edge")
+    ventanas = np.lib.stride_tricks.sliding_window_view(ext, k)
+    return np.median(ventanas, axis=1)
+
+
+def extraer_senal_1d_imagen(masc_curva, x0, y0, modo_extraccion):
+    """
+    Convierte la mascara 2D de la curva en una senal 1D y(x) limpia y uniforme.
+    """
+    h, w = masc_curva.shape[:2]
+
+    ys_globales, xs_globales = np.where(masc_curva > 0)
+    if len(xs_globales) < 20:
+        raise ValueError("No se pudo detectar una senal clara en la imagen.")
+
+    y_min_px = float(np.percentile(ys_globales, 1))
+    y_max_px = float(np.percentile(ys_globales, 99))
+    alto_senal = max(10.0, y_max_px - y_min_px)
+
+    eje_y_estimado = False
+    if y0 is None:
+        y0 = 0.5 * (y_min_px + y_max_px)
+        eje_y_estimado = True
+
+    trazo = np.full(w, np.nan, dtype=np.float64)
+    for col in range(w):
+        ys = np.where(masc_curva[:, col] > 0)[0]
+        if len(ys) == 0:
+            continue
+
+        if (ys[-1] - ys[0]) > 0.30 * alto_senal:
+            densidad_vert = len(ys) / float(ys[-1] - ys[0] + 1)
+            if densidad_vert > 0.35:
+                continue
+
+        trazo[col] = float(y0) - float(np.median(ys))
+
+    validos = np.where(~np.isnan(trazo))[0]
+    if len(validos) < 20:
+        raise ValueError("La senal extraida tiene muy pocos puntos validos.")
+
+    x_ini = int(validos[0])
+    x_fin = int(validos[-1])
+    if x_fin - x_ini < 20:
+        raise ValueError("El ancho de la senal detectada es insuficiente.")
+
+    sub_trazo = trazo[x_ini:x_fin + 1].copy()
+    n_sub = len(sub_trazo)
+
+    es_nan = np.isnan(sub_trazo)
+    if np.any(es_nan):
+        idx_val = np.where(~es_nan)[0]
+        sub_interp = np.interp(np.arange(n_sub), idx_val, sub_trazo[idx_val])
+
+        if modo_extraccion == "monocromo":
+            cambios = np.diff(np.concatenate(([0], es_nan.astype(int), [0])))
+            inicios_nan = np.where(cambios == 1)[0]
+            fines_nan = np.where(cambios == -1)[0]
+            for a_idx, b_idx in zip(inicios_nan, fines_nan):
+                if (b_idx - a_idx) > max(14, int(0.06 * n_sub)):
+                    sub_interp[a_idx:b_idx] = 0.0
+
+        sub_trazo = sub_interp
+
+    M = 600
+    x_viejo = np.linspace(0, n_sub - 1, n_sub)
+    x_nuevo = np.linspace(0, n_sub - 1, M)
+    y_norm = np.interp(x_nuevo, x_viejo, sub_trazo)
+    y_norm = _mediana_movil_1d(y_norm, k=5)
+
+    eje_x_estimado = False
+    if x0 is not None:
+        idx_x0 = int(np.round((x0 - x_ini) * (M - 1) / float(x_fin - x_ini)))
+        if idx_x0 < -int(0.10 * M) or idx_x0 > int(1.10 * M):
+            idx_x0 = M // 2
+            eje_x_estimado = True
+        else:
+            idx_x0 = int(np.clip(idx_x0, 0, M - 1))
+    else:
+        idx_x0 = M // 2
+        eje_x_estimado = True
+
+    escala_y = float(np.percentile(np.abs(y_norm), 99))
+    if escala_y < 1e-6:
+        escala_y = 1.0
+    y_norm = y_norm / escala_y
+
+    return y_norm, idx_x0, (x_ini, x_fin, y0, x0, eje_x_estimado, eje_y_estimado)
+
+
+def error_suave_1d(a_vec, b_vec, tol_px=5, usar_ac=False):
+    """
+    Calcula el error normalizado entre dos señales 1D con tolerancia horizontal
+    minima para evitar falsos errores por rasterizacion en saltos verticales.
+    """
+    n_len = len(a_vec)
+    if n_len < 10:
+        return 1.0
+
+    def dist_dir(u_v, v_v):
+        min_d = np.abs(u_v - v_v)
+        for shift in range(1, tol_px + 1):
+            d_der = np.abs(u_v[:-shift] - v_v[shift:])
+            min_d[:-shift] = np.minimum(min_d[:-shift], d_der)
+            d_izq = np.abs(u_v[shift:] - v_v[:-shift])
+            min_d[shift:] = np.minimum(min_d[shift:], d_izq)
+        return min_d
+
+    err_punto = 0.5 * (dist_dir(a_vec, b_vec) + dist_dir(b_vec, a_vec))
+    mae = float(np.mean(err_punto))
+
+    if usar_ac:
+        ac_a = float(np.std(a_vec))
+        ac_b = float(np.std(b_vec))
+        escala_ac = 0.5 * (ac_a + ac_b)
+        if escala_ac < 0.04:
+            denom = max(float(np.mean(np.abs(a_vec) + np.abs(b_vec)) * 0.5), 1e-6)
+            return mae / denom
+        return mae / (escala_ac * 1.4142 + 1e-6)
+    else:
+        rms = float(np.sqrt(0.5 * (np.mean(a_vec ** 2) + np.mean(b_vec ** 2))))
+        if rms < 1e-6:
+            return 1.0
+        return mae / rms
+
+
+def detectar_media_onda_imagen(y, umbral=0.20):
+    """
+    Busca si existe un semiperiodo h = T/2 tal que f(t + h) = -f(t)
+    en toda la porcion visible de la senal (soporta de 1 hasta ~8 periodos).
+    """
+    M = len(y)
+    h_min = max(18, int(0.06 * M))
+    h_max = int(0.54 * M)
+
+    errores = []
+    for h in range(h_min, h_max + 1, 2):
+        err = error_suave_1d(y[:-h], -y[h:], tol_px=5, usar_ac=False)
+        errores.append((h, err))
+
+    candidatos = []
+    for i in range(len(errores)):
+        h_act, e_act = errores[i]
+        if e_act < umbral:
+            e_izq = errores[i - 1][1] if i > 0 else 999.0
+            e_der = errores[i + 1][1] if i < len(errores) - 1 else 999.0
+            if e_act <= e_izq and e_act <= e_der:
+                candidatos.append((h_act, e_act))
+
+    if candidatos:
+        h_base = candidatos[0][0]
+        mejor_h = h_base
+        mejor_err = candidatos[0][1]
+        for h in range(max(h_min, h_base - 4), min(h_max, h_base + 4) + 1):
+            err = error_suave_1d(y[:-h], -y[h:], tol_px=5, usar_ac=False)
+            if err < mejor_err:
+                mejor_err = err
+                mejor_h = h
+
+        fin_p = min(M, 2 * mejor_h)
+        rms_p = float(np.sqrt(np.mean(y[:fin_p] ** 2))) + 1e-6
+        dc_rel = abs(float(np.mean(y[:fin_p]))) / rms_p
+
+        if mejor_err < umbral and dc_rel < 0.22:
+            return True, mejor_err, mejor_h
+
+    h_min_global, err_min_global = min(errores, key=lambda x: x[1])
+    return False, err_min_global, h_min_global
+
+
+def detectar_periodo_positivo_imagen(y):
+    """Estima el periodo T en muestras buscando la primera repeticion f(t + T) = f(t)."""
+    M = len(y)
+    t_min_p = int(0.12 * M)
+    t_max_p = int(0.68 * M)
+
+    errores = []
+    for p in range(t_min_p, t_max_p + 1, 3):
+        err = error_suave_1d(y[:-p], y[p:], tol_px=5, usar_ac=True)
+        errores.append((p, err))
+
+    for i in range(1, len(errores) - 1):
+        p_act, e_act = errores[i]
+        if e_act < 0.18 and e_act <= errores[i - 1][1] and e_act <= errores[i + 1][1]:
+            return p_act
+
+    return None
+
+
+def clasificar_simetria_imagen(y, idx_x0, umbral=0.20):
+    """
+    Evalua simultaneamente simetria par, impar, media onda, cuarto de onda par,
+    cuarto de onda impar o ninguna simetria (asimetrica).
+    """
+    M = len(y)
+
+    if float(np.max(np.abs(y))) < 1e-4:
+        return "SENAL NULA (f(t) = 0)", {
+            "par": 0.0, "impar": 0.0, "media_onda": 0.0,
+            "es_par": False, "es_impar": False, "es_media_onda": False
+        }, None
+
+    es_media_onda, err_mw, h_mw = detectar_media_onda_imagen(y, umbral=umbral)
+
+    # Caso A: El eje t = 0 esta en el interior de la grafica
+    if int(0.15 * M) <= idx_x0 <= int(0.85 * M):
+        mejor_err_par = 999.0
+        mejor_err_impar = 999.0
+
+        for delta in range(-7, 8):
+            c = idx_x0 + delta
+            radio = min(c, M - 1 - c)
+            if radio < int(0.12 * M):
+                continue
+
+            der = y[c:c + radio]
+            izq = y[c - radio + 1:c + 1][::-1]
+
+            e_par = error_suave_1d(izq, der, tol_px=5, usar_ac=True)
+            e_imp = error_suave_1d(izq, -der, tol_px=5, usar_ac=False)
+
+            if e_par < mejor_err_par:
+                mejor_err_par = e_par
+            if e_imp < mejor_err_impar:
+                mejor_err_impar = e_imp
+
+        err_par = mejor_err_par
+        err_impar = mejor_err_impar
+        T_estimado = (2 * h_mw) if es_media_onda else detectar_periodo_positivo_imagen(y)
+
+    # Caso B: El eje t = 0 esta en el borde izquierdo (ej. [0, T]) o derecho
+    else:
+        if es_media_onda:
+            T_estimado = min(M, 2 * h_mw)
+        else:
+            T_pos = detectar_periodo_positivo_imagen(y)
+            T_estimado = T_pos if T_pos is not None else M
+
+        if idx_x0 < int(0.15 * M):
+            seg = y[idx_x0:min(M, idx_x0 + T_estimado)]
+        else:
+            seg = y[max(0, idx_x0 - T_estimado):idx_x0 + 1]
+
+        err_par = error_suave_1d(seg, seg[::-1], tol_px=5, usar_ac=True)
+        err_impar = error_suave_1d(seg, -seg[::-1], tol_px=5, usar_ac=False)
+
+    es_par = err_par < umbral
+    es_impar = err_impar < umbral
+
+    if es_par and es_impar:
+        if err_par <= err_impar:
+            es_impar = False
+        else:
+            es_par = False
+
+    if es_par and es_media_onda:
+        clasificacion = "SIMETRIA DE CUARTO DE ONDA PAR"
+    elif es_impar and es_media_onda:
+        clasificacion = "SIMETRIA DE CUARTO DE ONDA IMPAR"
+    elif es_par:
+        clasificacion = "SIMETRIA PAR"
+    elif es_impar:
+        clasificacion = "SIMETRIA IMPAR"
+    elif es_media_onda:
+        clasificacion = "SIMETRIA DE MEDIA ONDA"
+    else:
+        clasificacion = "NINGUNA SIMETRIA (SENAL ASIMETRICA)"
+
+    metricas = {
+        "par": err_par,
+        "impar": err_impar,
+        "media_onda": err_mw,
+        "es_par": es_par,
+        "es_impar": es_impar,
+        "es_media_onda": es_media_onda,
+    }
+
+    return clasificacion, metricas, T_estimado
+
+
+def ejecutar_reconocimiento_por_imagen():
+    """
+    Flujo interactivo para adjuntar cualquier imagen de señal (sin ingresar
+    parametros ni escalas de ejes), identificar su simetria y mostrar el diagnostico.
+    """
+    print("\n==========================================")
+    print("  RECONOCIMIENTO DE SIMETRIA POR IMAGEN")
+    print("==========================================")
+    print("Clasificaciones posibles:")
+    print("  - Simetría Par")
+    print("  - Simetría Impar")
+    print("  - Simetría de Media Onda")
+    print("  - Simetría de Cuarto de Onda Par")
+    print("  - Simetría de Cuarto de Onda Impar")
+    print("  - Ninguna simetría (Asimétrica)\n")
+
+    ruta_img = seleccionar_ruta_imagen()
+    if not ruta_img:
+        print("No se seleccionó ninguna imagen.")
+        return
+
+    try:
+        img = cargar_imagen_segura(ruta_img)
+        roi, hubo_recorte = recortar_marco_grafica(img)
+        roi, x0, y0, angulo_corr = enderezar_y_detectar_ejes(roi)
+        masc_curva, modo_extraccion = extraer_mascara_curva(roi, x0, y0)
+        y_norm, idx_x0, info = extraer_senal_1d_imagen(masc_curva, x0, y0, modo_extraccion)
+        x_ini, x_fin, y0_final, x0_orig, eje_x_est, eje_y_est = info
+
+        clasificacion, metricas, _ = clasificar_simetria_imagen(y_norm, idx_x0)
+    except Exception as err:
+        print(f"\nError al procesar la imagen: {err}")
+        return
+
+    sim_par = max(0.0, (1.0 - metricas["par"]) * 100.0)
+    sim_impar = max(0.0, (1.0 - metricas["impar"]) * 100.0)
+    sim_mw = max(0.0, (1.0 - metricas["media_onda"]) * 100.0)
+
+    print("\n==========================================================")
+    print("         DETECCION DE SIMETRIA POR IMAGEN")
+    print("==========================================================")
+    print(f"Imagen analizada : {os.path.basename(ruta_img)}")
+    print(f"Modo de lectura  : {modo_extraccion.upper()} (marco recortado: {'Si' if hubo_recorte else 'No'})")
+    if abs(angulo_corr) > 0.25:
+        print(f"Enderezado auto  : {angulo_corr:+.2f}° corregidos")
+    print(f"Eje t = 0        : {'Estimado (centro)' if eje_x_est else 'Detectado automaticamente'}")
+    print(f"Eje y = 0        : {'Estimado (centro)' if eje_y_est else 'Detectado automaticamente'}")
+    print("----------------------------------------------------------")
+    print(f"  Similitud Par        : {sim_par:6.2f}%  {'[CUMPLE]' if metricas['es_par'] else ''}")
+    print(f"  Similitud Impar      : {sim_impar:6.2f}%  {'[CUMPLE]' if metricas['es_impar'] else ''}")
+    print(f"  Similitud Media Onda : {sim_mw:6.2f}%  {'[CUMPLE]' if metricas['es_media_onda'] else ''}")
+    print("----------------------------------------------------------")
+    print(f">>> RESULTADO FINAL: {clasificacion} <<<")
+    print("==========================================================\n")
+
+    fig_img, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.5))
+
+    ax1.imshow(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+    ax1.axhline(y0_final, color="red", linestyle="--", linewidth=1.3, label="Eje y = 0 usado")
+    if x0_orig is not None:
+        ax1.axvline(x0_orig, color="lime", linestyle="--", linewidth=1.3, label="Eje t = 0 usado")
+    else:
+        ax1.axvline(0.5 * (x_ini + x_fin), color="lime", linestyle=":", linewidth=1.3, label="Centro t = 0 estimado")
+    ax1.set_title("Imagen procesada y ejes detectados", fontsize=12, fontweight="bold")
+    ax1.legend(loc="best", fontsize=9)
+    ax1.axis("off")
+
+    eje_t = np.arange(len(y_norm)) - idx_x0
+    ax2.plot(eje_t, y_norm, color="tab:blue", linewidth=2.4, label="Señal extraída (limpia)")
+    ax2.axhline(0, color="black", linewidth=0.9, alpha=0.7)
+    ax2.axvline(0, color="red", linestyle="--", linewidth=1.2, label="Referencia t = 0")
+    ax2.set_title(f"CLASIFICACIÓN:\n{clasificacion}", fontsize=12.5, fontweight="bold", color="#0b5394")
+    ax2.set_xlabel("Muestras relativas a t = 0")
+    ax2.set_ylabel("Amplitud normalizada")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="best", fontsize=9)
+
+    fig_img.suptitle("RECONOCIMIENTO AUTOMÁTICO DE SIMETRÍA POR IMAGEN", fontsize=14, fontweight="bold")
+    fig_img.tight_layout()
+    plt.show()
+    plt.close(fig_img)
+
+
+# ==========================================================
+# BLOQUE 3. ENTRADAS DEL PROGRAMA
+# ==========================================================
+
+print("==========================================")
+print("       SERIE DE FOURIER POR TRAMOS")
+print("==========================================")
+print("Seleccione qué desea realizar:")
+print("1. Calcular Serie de Fourier por tramos (Normal o Forzar Simetría)")
+print("2. Reconocer tipo de simetría adjuntando una imagen")
+
+modo_inicial = input("\nSeleccione una opción (1 o 2) [Enter = 1]: ").strip()
+if modo_inicial == "2":
+    ejecutar_reconocimiento_por_imagen()
+    continuar_calculo = input("\n¿Desea continuar al cálculo de Serie de Fourier por tramos? (s/n): ").strip().lower()
+    if continuar_calculo != "s":
+        raise SystemExit("\nPrograma finalizado.")
+
+print("\nIngrese los extremos de la senal base.")
+t_min_ingresado = leer_numero(input("Ingrese t_min del intervalo: "))
+t_max_ingresado = leer_numero(input("Ingrese t_max del intervalo: "))
+
+t_min = t_min_ingresado
+t_max = t_max_ingresado
+T_original = simplificar(t_max_ingresado - t_min_ingresado)
+T = T_original
+
+if float(T) <= 0:
+    raise ValueError("El periodo debe ser mayor que cero.")
+
+centro = simplificar((t_min + t_max) / 2)
+mitad = simplificar(T / 2)
+cuarto = simplificar(T / 4)
+
+print("\n------------------------------------------")
+print("CANTIDAD DE ARMONICOS")
+print("------------------------------------------")
+
+N1 = int(input("Ingrese N1 - armonicos para la senal/Fourier: "))
+# N2 = int(input("Ingrese N2 - armonicos para Dirichlet: "))
+# N3 = int(input("Ingrese N3 - armonicos para Parseval: "))
+
+if N1 < 0:  # or N2 < 0 or N3 < 0:
+    raise ValueError("La cantidad de armonicos no puede ser negativa.")
+
+w0 = simplificar(2 * sp.pi / T)
+
+
+# ==========================================================
+# BLOQUE 4. INGRESAR LA SENAL ORIGINAL COMPLETA
+# ==========================================================
+
+print("\n==========================================")
+print("           SENAL ORIGINAL")
+print("==========================================")
+print(f"Ingrese la senal en TODO el intervalo: {t_min} < t < {t_max}")
+print("Los tramos deben cubrir el intervalo completo sin huecos ni superposiciones.")
+print("Ejemplo de funcion: 2*t")
+print("Tambien puede usar: sin(t), cos(t), t**2, 3*t + 1, etc.\n")
+
+while True:
+    tramos_originales = []
+
+    num_tramos = int(input("\nIngrese el numero de tramos de la senal: "))
+
+    if num_tramos <= 0:
+        print("Debe ingresar al menos un tramo.")
+        continue
+
+    for i in range(num_tramos):
+        print(f"--- Tramo {i + 1} ---")
+
+        funcion = input("Funcion f(t): ")
+        limite_inf = leer_numero(input("Limite inferior: "))
+        limite_sup = leer_numero(input("Limite superior: "))
+
+        expresion = sp.sympify(
+            funcion,
+            locals={"t": t}
+        )
+
+        tramos_originales.append((
+            expresion,
+            limite_inf,
+            limite_sup
+        ))
+
+    correcto, mensaje = validar_tramos_base(
+        tramos_originales,
+        t_min,
+        t_max
+    )
+
+    if correcto:
+        tramos_originales.sort(key=lambda tramo: float(tramo[1]))
+        print("\n" + mensaje)
+        break
+
+    print("\nERROR EN LOS TRAMOS:")
+    print(mensaje)
+    print("Vuelva a ingresar todos los tramos.\n")
+
+
+# ==========================================================
+# BLOQUE 5. ELEGIR ANALISIS NORMAL O FORZAR SIMETRIA
+# ==========================================================
+
+print("\n==========================================")
+print("       MODO DE ANALISIS DE LA SENAL")
+print("==========================================")
+print("0. Normal (conservar la senal original)")
+print("1. Forzar simetria par")
+print("2. Forzar simetria impar")
+print("3. Forzar simetria de media onda")
+print("4. Forzar simetria de cuarto de onda par")
+print("5. Forzar simetria de cuarto de onda impar")
+
+opcion = int(input("\nSeleccione una opcion (0-5): "))
+
+if opcion not in [0, 1, 2, 3, 4, 5]:
+    raise ValueError("Opcion no valida. Debe seleccionar un numero del 0 al 5.")
+
+nombres_simetria = {
+    0: "Normal (sin forzar simetria)",
+    1: "Par",
+    2: "Impar",
+    3: "Media onda",
+    4: "Cuarto de onda par",
+    5: "Cuarto de onda impar"
+}
+
+nombre_simetria = nombres_simetria[opcion]
+
+# Si es modo normal, la referencia de fase es 0 (serie estandar cos(n*w0*t))
+# y el periodo es el ingresado. Si se fuerza simetria, la senal ingresada se
+# extiende geometricamente con todos sus tramos para cumplir la simetria.
+if opcion == 0:
+    tramos = list(tramos_originales)
+    tramos_detalle = [(expr, a, b, "Original") for expr, a, b in tramos_originales]
+    t_referencia = sp.Integer(0)
+    print("\nSe utilizara la senal original completa, sin modificar.")
+else:
+    print("\nSe utilizaran TODOS los tramos de la senal original.")
+    print("El programa extendera y reflejara/desplazara la senal ingresada")
+    print("para construir el periodo completo con la simetria seleccionada.")
+
+    tramos, tramos_detalle, t_min, t_max, t_referencia = forzar_simetria_completa(
+        tramos_originales,
+        opcion,
+        t_min_ingresado,
+        t_max_ingresado
+    )
+
+    T = simplificar(t_max - t_min)
+    centro = simplificar((t_min + t_max) / 2)
+    mitad = simplificar(T / 2)
+    cuarto = simplificar(T / 4)
+    w0 = simplificar(2 * sp.pi / T)
+
+    print("\nLa senal completa fue forzada correctamente.")
+
+print("\n==========================================")
+print("           SENAL DE TRABAJO")
+print("==========================================")
+print(f"Modo seleccionado: {nombre_simetria}")
+print(f"Intervalo original ingresado: [{t_min_ingresado}, {t_max_ingresado}] (L = {T_original})")
+print(f"Periodo resultante de trabajo: [{t_min}, {t_max}] (T = {T})")
+print(f"Eje de simetria / referencia = {t_referencia}")
+print(f"Centro del periodo = {centro}")
+print(f"Tramos originales ingresados: {len(tramos_originales)}")
+print(f"Tramos de la senal resultante: {len(tramos)}")
+print("\nFunciones que utilizara el analisis:")
+
+for i, (expresion, a, b, etiqueta) in enumerate(tramos_detalle, start=1):
+    print(f"Tramo {i} [{etiqueta}]: {a} < t < {b}")
+    print("f(t) =")
+    sp.pprint(expresion)
+
+
+# ==========================================================
+# BLOQUE 7. PERIODO Y FRECUENCIA ANGULAR
+# ==========================================================
+
+print("\n==========================================")
+print("              PERIODO")
+print("==========================================")
+print("\nT =")
+sp.pprint(T)
+
+print("\nCentro del periodo =")
+sp.pprint(centro)
+
+print("\nw0 =")
+sp.pprint(w0)
+
+
+# ==========================================================
+# BLOQUE 8. FOURIER ORIGINAL
+# ==========================================================
+
+# ----------------------------------------------------------
+# a0
+# ----------------------------------------------------------
+
+a0 = 0
+
+for expresion, a, b in tramos:
+    variable = obtener_variable(expresion)
+
+    if variable is None:
+        a0 += (2 / T) * expresion * (b - a)
+    else:
+        a0 += (2 / T) * sp.integrate(
+            expresion,
+            (variable, a, b),
+            conds='none'
+        )
+
+a0 = sp.simplify(a0)
+
+
+# ----------------------------------------------------------
+# an Y bn
+# ----------------------------------------------------------
+
+an = []
+bn = []
+
+for n in range(1, N1 + 1):
+    a_n = 0
+    b_n = 0
+
+    for expresion, a, b in tramos:
+        variable = obtener_variable(expresion)
+
+        if variable is None:
+            variable = t
+
+        argumento = n * w0 * (variable - t_referencia)
+
+        a_n += (2 / T) * sp.integrate(
+            expresion * sp.cos(argumento),
+            (variable, a, b),
+            conds='none'
+        )
+
+        b_n += (2 / T) * sp.integrate(
+            expresion * sp.sin(argumento),
+            (variable, a, b),
+            conds='none'
+        )
+
+    an.append(sp.simplify(a_n))
+    bn.append(sp.simplify(b_n))
+
+
+# ==========================================================
+# BLOQUE 9. CONSTRUIR SERIE DE FOURIER
+# ==========================================================
+
+serie_fourier = sp.simplify(a0 / 2)
+
+for n in range(1, N1 + 1):
+    argumento = n * w0 * (t - t_referencia)
+
+    serie_fourier += (
+        sp.simplify(an[n - 1]) * sp.cos(argumento)
+        +
+        sp.simplify(bn[n - 1]) * sp.sin(argumento)
+    )
+
+
+# ==========================================================
+# BLOQUE 10. MOSTRAR RESULTADOS DE FOURIER
+# ==========================================================
+
+print("\n==========================================")
+print("              RESULTADOS")
+print("==========================================")
+
+print("\na0 =")
+sp.pprint(a0)
+
+print("\na0/2 =")
+sp.pprint(simplificar(a0 / 2))
+
+
+# ==========================================================
+# BLOQUE 11. SERIE DE FOURIER
+# ==========================================================
+
+print("\n==========================================")
+print("            SERIE DE FOURIER")
+print("==========================================")
+print("\nf(t) ≈")
+sp.pprint(
+    sp.expand(serie_fourier),
+    use_unicode=True
+)
+
+
+# ==========================================================
+# BLOQUE 11A. MOSTRAR TODOS LOS COEFICIENTES an Y bn
+# ==========================================================
+
+print("\n==========================================")
+print("       COEFICIENTES DE FOURIER an Y bn")
+print("==========================================")
+print(f"\nCantidad de armonicos calculados: N1 = {N1}")
+
+print("\nCoeficientes a_n:")
+if N1 == 0:
+    print("No se solicitaron armonicos.")
+else:
+    for n in range(1, N1 + 1):
+        print(f"a_{n} =")
+        sp.pprint(an[n - 1])
+
+print("\nCoeficientes b_n:")
+if N1 == 0:
+    print("No se solicitaron armonicos.")
+else:
+    for n in range(1, N1 + 1):
+        print(f"b_{n} =")
+        sp.pprint(bn[n - 1])
+
+print("\nResumen de coeficientes en forma de vectores:")
+print("an =")
+sp.pprint(sp.Tuple(*an), use_unicode=True)
+print("bn =")
+sp.pprint(sp.Tuple(*bn), use_unicode=True)
+
+
+# ==========================================================
+# BLOQUE 11B. COEFICIENTES GENERICOS an Y bn
+# ==========================================================
+
+n_generico = sp.symbols("n", integer=True, positive=True)
+
+a_n_generico = 0
+b_n_generico = 0
+
+for expresion, a, b in tramos:
+    variable = obtener_variable(expresion)
+
+    if variable is None:
+        variable = t
+
+    argumento_generico = (
+        n_generico * w0 * (variable - t_referencia)
+    )
+
+    a_n_generico += (2 / T) * sp.integrate(
+        expresion * sp.cos(argumento_generico),
+        (variable, a, b),
+        conds='none'
+    )
+
+    b_n_generico += (2 / T) * sp.integrate(
+        expresion * sp.sin(argumento_generico),
+        (variable, a, b),
+        conds='none'
+    )
+
+a_n_generico = sp.simplify(
+    sp.trigsimp(
+        sp.refine(a_n_generico, sp.Q.integer(n_generico))
+    )
+)
+
+b_n_generico = sp.simplify(
+    sp.trigsimp(
+        sp.refine(b_n_generico, sp.Q.integer(n_generico))
+    )
+)
+
+print("\n==========================================")
+print("       FORMULAS GENERALES DE FOURIER")
+print("==========================================")
+print("Estas formulas conservan n como variable simbolica.")
+print(f"Son validas para n = 1, 2, ..., N1 = {N1}.")
+
+print("\nFormula general de a_n:")
+sp.pprint(
+    sp.Eq(sp.Symbol("a_n"), a_n_generico),
+    use_unicode=True
+)
+
+print("\nFormula general de b_n:")
+sp.pprint(
+    sp.Eq(sp.Symbol("b_n"), b_n_generico),
+    use_unicode=True
+)
+
+print("\nNota: los valores individuales a_1,...,a_N1 y b_1,...,b_N1")
+print("mostrados en el bloque anterior se mantienen sin cambios y")
+print("son los que utiliza la serie de Fourier y su grafica.")
+
+
+# ==========================================================
+# BLOQUE 12. COEFICIENTES PARA DIRICHLET/PARSEVAL (COMENTADO)
+# ==========================================================
+
+# def calcular_coeficientes(numero_armonicos):
+#     """Calcula a0, an y bn para la cantidad solicitada de armonicos."""
+#
+#     a0_correcto = 0
+#
+#     for expresion, a, b in tramos:
+#         variable = obtener_variable(expresion)
+#
+#         if variable is None:
+#             a0_correcto += expresion * (b - a)
+#         else:
+#             a0_correcto += sp.integrate(
+#                 expresion,
+#                 (variable, a, b)
+#             )
+#
+#     a0_correcto = simplificar(
+#         (2 / T) * a0_correcto
+#     )
+#
+#     an_correcto = []
+#     bn_correcto = []
+#
+#     for n in range(1, numero_armonicos + 1):
+#         a_n = 0
+#         b_n = 0
+#
+#         for expresion, a, b in tramos:
+#             variable = obtener_variable(expresion)
+#
+#             if variable is None:
+#                 variable = sp.Symbol("_x_parseval", real=True)
+#
+#             argumento = n * w0 * (variable - t_referencia)
+#
+#             a_n += sp.integrate(
+#                 expresion * sp.cos(argumento),
+#                 (variable, a, b)
+#             )
+#
+#             b_n += sp.integrate(
+#                 expresion * sp.sin(argumento),
+#                 (variable, a, b)
+#             )
+#
+#         a_n = simplificar((2 / T) * a_n)
+#         b_n = simplificar((2 / T) * b_n)
+#
+#         an_correcto.append(a_n)
+#         bn_correcto.append(b_n)
+#
+#     return a0_correcto, an_correcto, bn_correcto
+
+
+# ==========================================================
+# BLOQUE 13. DIRICHLET (COMENTADO)
+# ==========================================================
+
+# print("\n==========================================")
+# print(f"     VERIFICACION DE DIRICHLET - N = {N2}")
+# print("==========================================")
+#
+# for i in range(len(tramos) - 1):
+#     expresion_izq = tramos[i][0]
+#     expresion_der = tramos[i + 1][0]
+#     punto = tramos[i][2]
+#
+#     variable_izq = obtener_variable(expresion_izq)
+#     variable_der = obtener_variable(expresion_der)
+#
+#     if variable_izq is None:
+#         limite_izq = expresion_izq
+#     else:
+#         limite_izq = sp.limit(
+#             expresion_izq,
+#             variable_izq,
+#             punto,
+#             dir='-'
+#         )
+#
+#     if variable_der is None:
+#         limite_der = expresion_der
+#     else:
+#         limite_der = sp.limit(
+#             expresion_der,
+#             variable_der,
+#             punto,
+#             dir='+'
+#         )
+#
+#     limite_izq = simplificar(limite_izq)
+#     limite_der = simplificar(limite_der)
+#
+#     print(f"\nPunto t = {punto}")
+#     print("Limite izquierdo:")
+#     sp.pprint(limite_izq)
+#
+#     print("Limite derecho:")
+#     sp.pprint(limite_der)
+#
+#     if son_iguales(limite_izq, limite_der):
+#         print("→ La señal es continua.")
+#     else:
+#         promedio = simplificar((limite_izq + limite_der) / 2)
+#         print("→ Existe un salto finito.")
+#         print("→ Segun Dirichlet, Fourier converge al promedio:")
+#         sp.pprint(promedio)
+#
+#
+# # ----------------------------------------------------------
+# # CONEXION PERIODICA
+# # ----------------------------------------------------------
+#
+# expresion_final = tramos[-1][0]
+# expresion_inicio = tramos[0][0]
+#
+# variable_final = obtener_variable(expresion_final)
+# variable_inicio = obtener_variable(expresion_inicio)
+#
+# if variable_final is None:
+#     limite_final = expresion_final
+# else:
+#     limite_final = sp.limit(
+#         expresion_final,
+#         variable_final,
+#         t_max,
+#         dir='-'
+#     )
+#
+# if variable_inicio is None:
+#     limite_inicio = expresion_inicio
+# else:
+#     limite_inicio = sp.limit(
+#         expresion_inicio,
+#         variable_inicio,
+#         t_min,
+#         dir='+'
+#     )
+#
+# limite_final = simplificar(limite_final)
+# limite_inicio = simplificar(limite_inicio)
+#
+# print("\nExtremos del periodo:")
+# print("f(t_max-) =")
+# sp.pprint(limite_final)
+#
+# print("f(t_min+) =")
+# sp.pprint(limite_inicio)
+#
+# if son_iguales(limite_final, limite_inicio):
+#     print("→ No existe salto en la conexion periodica.")
+# else:
+#     promedio_extremos = simplificar(
+#         (limite_final + limite_inicio) / 2
+#     )
+#     print("→ Existe un salto en la conexion periodica.")
+#     print("→ Fourier converge al promedio:")
+#     sp.pprint(promedio_extremos)
+#
+#
+# # ----------------------------------------------------------
+# # FOURIER EN LOS PUNTOS DE DISCONTINUIDAD CON N2
+# # ----------------------------------------------------------
+#
+# a0_dir, an_dir, bn_dir = calcular_coeficientes(N2)
+#
+# print(
+#     f"\nAproximacion de Fourier con N = {N2} "
+#     f"en los puntos de cambio:"
+# )
+#
+# for i in range(len(tramos) - 1):
+#     punto = tramos[i][2]
+#     suma_dir = a0_dir / 2
+#
+#     for n in range(1, N2 + 1):
+#         argumento = n * w0 * (punto - t_referencia)
+#
+#         suma_dir += (
+#             an_dir[n - 1] * sp.cos(argumento)
+#             +
+#             bn_dir[n - 1] * sp.sin(argumento)
+#         )
+#
+#     suma_dir = simplificar(suma_dir)
+#
+#     print(f"\nt = {punto}")
+#     print("S_N(t) =")
+#     sp.pprint(suma_dir)
+#
+# print("\n✓ Dirichlet evaluado.")
+
+
+# ==========================================================
+# BLOQUE 14. PARSEVAL (COMENTADO)
+# ==========================================================
+
+# print("\n==========================================")
+# print(f"             PARSEVAL - N = {N3}")
+# print("==========================================")
+#
+# energia = 0
+#
+# for expresion, a, b in tramos:
+#     variable = obtener_variable(expresion)
+#
+#     if variable is None:
+#         energia += expresion**2 * (b - a)
+#     else:
+#         energia += sp.integrate(
+#             expresion**2,
+#             (variable, a, b)
+#         )
+#
+# energia = simplificar(energia / T)
+#
+# print("\nLado izquierdo:")
+# print("1/T integral f(t)^2 dt =")
+# sp.pprint(energia, use_unicode=True)
+#
+# a0_p, an_p, bn_p = calcular_coeficientes(N3)
+#
+# parseval_N = a0_p**2 / 4
+#
+# for n in range(1, N3 + 1):
+#     parseval_N += (
+#         an_p[n - 1]**2
+#         +
+#         bn_p[n - 1]**2
+#     ) / 2
+#
+# parseval_N = simplificar(parseval_N)
+#
+# print(f"\nParseval usando los {N3} armonicos:")
+# print("a0²/4 + 1/2 sum(an² + bn²) =")
+# sp.pprint(parseval_N, use_unicode=True)
+#
+# diferencia = simplificar(energia - parseval_N)
+#
+# print("\nDiferencia:")
+# sp.pprint(diferencia, use_unicode=True)
+#
+# if son_iguales(energia, 0):
+#     efectividad = None
+#     print("\nLa señal tiene energia cero; no se puede calcular el porcentaje.")
+# else:
+#     efectividad = sp.N((parseval_N / energia) * 100)
+#     print(f"\nEfectividad con {N3} armonicos:")
+#     print(f"{float(efectividad):.10f} %")
+#
+# print(
+#     "\nNota: la igualdad exacta de Parseval "
+#     "se obtiene cuando N tiende a infinito."
+# )
+
+
+# ==========================================================
+# BLOQUE 15. PIECEWISE PARA LA GRAFICA
+# ==========================================================
+
+condiciones_entrada = []
+
+for expresion, a, b in tramos_originales:
+    condiciones_entrada.append((
+        expresion,
+        (t >= a) & (t <= b)
+    ))
+
+f_pw_entrada = sp.Piecewise(
+    *condiciones_entrada,
+    (0, True)
+)
+
+condiciones = []
+
+for expresion, a, b in tramos:
+    condiciones.append((
+        expresion,
+        (t >= a) & (t <= b)
+    ))
+
+f_pw = sp.Piecewise(
+    *condiciones,
+    (0, True)
+)
+
+
+# ==========================================================
+# BLOQUE 16. FUNCIONES NUMERICAS
+# ==========================================================
+
+f_entrada = sp.lambdify(
+    t,
+    f_pw_entrada,
+    "numpy"
+)
+
+f_original = sp.lambdify(
+    t,
+    f_pw,
+    "numpy"
+)
+
+f_fourier = sp.lambdify(
+    t,
+    serie_fourier,
+    "numpy"
+)
+
+
+# ==========================================================
+# BLOQUE 17. PUNTOS PARA LA GRAFICA
+# ==========================================================
+
+puntos = np.linspace(
+    float(t_min),
+    float(t_max),
+    2400
+)
+
+y_entrada = evaluar_funcion(f_entrada, puntos)
+y_original = evaluar_funcion(f_original, puntos)
+y_fourier = evaluar_funcion(f_fourier, puntos)
+
+
+# ==========================================================
+# BLOQUE 18. PREPARAR LA SERIE DE FOURIER PARA MOSTRARLA
+# ==========================================================
+
+serie_expandida = sp.expand(serie_fourier)
+terminos_serie = sp.Add.make_args(serie_expandida)
+
+terminos_latex = []
+
+for termino in terminos_serie:
+    termino_simplificado = sp.simplify(termino)
+    terminos_latex.append(sp.latex(termino_simplificado))
+
+lineas_serie = []
+linea_actual = ""
+
+for termino in terminos_latex:
+    if linea_actual == "":
+        linea_actual = termino
+    else:
+        if termino.startswith("-"):
+            linea_nueva = linea_actual + " " + termino
+        else:
+            linea_nueva = linea_actual + " + " + termino
+
+        if len(linea_nueva) > 70:
+            lineas_serie.append(linea_actual)
+            linea_actual = termino
+        else:
+            linea_actual = linea_nueva
+
+if linea_actual != "":
+    lineas_serie.append(linea_actual)
+
+
+# ==========================================================
+# BLOQUE 19. TEXTO DE LA SERIE
+# ==========================================================
+
+texto_serie = (
+    "Serie de Fourier "
+    + f"({N1} armonicos)"
+    + "\n\n"
+)
+
+for i, linea in enumerate(lineas_serie):
+    texto_serie += "$" + linea + "$"
+
+    if i != len(lineas_serie) - 1:
+        texto_serie += "\n"
+
+
+# ==========================================================
+# BLOQUE 19A. PREPARAR FORMULAS GENERALES PARA LA GRAFICA
+# ==========================================================
+
+texto_a_generico_grafica = sp.pretty(
+    a_n_generico,
+    use_unicode=True,
+    wrap_line=True,
+    num_columns=46
+)
+
+texto_b_generico_grafica = sp.pretty(
+    b_n_generico,
+    use_unicode=True,
+    wrap_line=True,
+    num_columns=46
+)
+
+texto_genericos_grafica = (
+    "COEFICIENTES GENERALES (n simbolico)\n\n"
+    "a_n =\n"
+    + texto_a_generico_grafica
+    + "\n\n"
+    + "b_n =\n"
+    + texto_b_generico_grafica
+)
+
+
+# ==========================================================
+# BLOQUE 20. PRIMERA GRAFICA: FUNCION EXACTA Y FOURIER
+# ==========================================================
+
+fig = plt.figure(figsize=(16, 9.5))
+gs = fig.add_gridspec(
+    2,
+    2,
+    width_ratios=[2.3, 1.0],
+    height_ratios=[3.2, 1.15],
+    hspace=0.30,
+    wspace=0.18
+)
+
+ax = fig.add_subplot(gs[0, 0])
+ax_datos = fig.add_subplot(gs[0, 1])
+ax_serie = fig.add_subplot(gs[1, :])
+
+# Graficar tramo por tramo la senal exacta para no unir saltos
+for idx_tramo, (expr_tr, a_tr, b_tr) in enumerate(tramos):
+    pts_tr = np.linspace(float(a_tr), float(b_tr), 400)
+    fn_tr = sp.lambdify(t, expr_tr, "numpy")
+    val_tr = evaluar_funcion(fn_tr, pts_tr)
+    ax.plot(
+        pts_tr,
+        val_tr,
+        label="Senal por tramos (trabajo)" if idx_tramo == 0 else None,
+        linewidth=2.8,
+        color="tab:blue"
+    )
+
+ax.plot(
+    puntos,
+    y_fourier,
+    label=f"Aproximacion de Fourier - N = {N1}",
+    linewidth=2.0,
+    linestyle="--",
+    color="tab:orange"
+)
+
+ax.axhline(0, color="black", linewidth=0.8, alpha=0.5)
+ax.axvline(float(t_referencia), color="gray", linewidth=1.0, linestyle=":", alpha=0.7)
+
+ax.set_xlabel("t", fontsize=12)
+ax.set_ylabel("f(t)", fontsize=12)
+ax.set_title(
+    f"Senal de trabajo y aproximacion de Fourier\nModo: {nombre_simetria} | Periodo: [{sp.sstr(t_min)}, {sp.sstr(t_max)}]",
+    fontsize=14,
+    pad=12
+)
+ax.grid(True, alpha=0.28)
+ax.legend(fontsize=10, loc="best")
+
+ax_datos.axis("off")
+
+texto_panel = (
+    "DATOS DEL ANALISIS\n"
+    f"Modo = {nombre_simetria}\n"
+    f"T = {sp.sstr(T)}\n"
+    f"w0 = {sp.sstr(w0)}\n"
+    f"a0 = {sp.sstr(sp.simplify(a0))}\n"
+    f"N1 = {N1}\n\n"
+    "FORMULAS GENERALES\n"
+    "a_n =\n"
+    + sp.pretty(
+        a_n_generico,
+        use_unicode=True,
+        wrap_line=True,
+        num_columns=38
+    )
+    + "\n\nb_n =\n"
+    + sp.pretty(
+        b_n_generico,
+        use_unicode=True,
+        wrap_line=True,
+        num_columns=38
+    )
+)
+
+ax_datos.text(
+    0.02,
+    0.98,
+    texto_panel,
+    transform=ax_datos.transAxes,
+    ha="left",
+    va="top",
+    fontsize=8.4,
+    family="DejaVu Sans Mono",
+    linespacing=1.18,
+    bbox=dict(
+        boxstyle="round,pad=0.65",
+        facecolor="white",
+        edgecolor="gray",
+        alpha=0.98
+    )
+)
+
+ax_serie.axis("off")
+ax_serie.set_title(
+    f"SERIE DE FOURIER ({N1} armonicos)",
+    fontsize=10,
+    pad=3
+)
+
+ax_serie.text(
+    0.50,
+    0.87,
+    texto_serie,
+    transform=ax_serie.transAxes,
+    ha="center",
+    va="top",
+    fontsize=8.8,
+    family="DejaVu Sans",
+    linespacing=1.30,
+    bbox=dict(
+        boxstyle="round,pad=0.65",
+        facecolor="white",
+        edgecolor="gray",
+        alpha=0.98
+    )
+)
+
+fig.suptitle(
+    "ANALISIS DE FOURIER DE LA SENAL",
+    fontsize=16,
+    fontweight="bold",
+    y=0.985
+)
+
+plt.show()
+plt.close(fig)
+
+
+# ==========================================================
+# BLOQUE 20A. SEGUNDA GRAFICA: VISUALIZACION AMPLIA DE LA SIMETRIA FORZADA
+# ==========================================================
+
+if opcion != 0:
+    fig_forzada, (ax_forzada, ax_periodica) = plt.subplots(
+        2, 1,
+        figsize=(16, 10),
+        gridspec_kw={"height_ratios": [1.35, 1.0], "hspace": 0.35}
+    )
+
+    colores_bloques = {
+        "Original (Mitad derecha)": ("#1f77b4", "-"),
+        "Reflejo Par (Mitad izquierda)": ("#d62728", "-"),
+        "Reflejo Impar (Mitad izquierda)": ("#d62728", "-"),
+        "Original (1er Medio Periodo)": ("#1f77b4", "-"),
+        "Media Onda -f(t - T/2) (2do Medio Periodo)": ("#2ca02c", "-"),
+        "1er Cuarto (Original)": ("#1f77b4", "-"),
+        "2do Cuarto (Antisimétrico en T/4)": ("#ff7f0e", "-"),
+        "2do Cuarto (Simétrico en T/4)": ("#ff7f0e", "-"),
+        "3er Cuarto (Media onda Q1)": ("#2ca02c", "-"),
+        "4to Cuarto (Reflejo Par en T)": ("#d62728", "-"),
+        "4to Cuarto (Reflejo Impar en T)": ("#d62728", "-"),
+    }
+
+    etiquetas_usadas = set()
+
+    # 1. Graficar en el panel superior el periodo completo forzado diferenciando cada bloque
+    for expresion, a, b, etiqueta in tramos_detalle:
+        ancho_tramo = float(b - a)
+        cantidad_puntos = max(200, int(2400 * ancho_tramo / float(T)))
+
+        puntos_tramo = np.linspace(float(a), float(b), cantidad_puntos, endpoint=True)
+        funcion_tramo = sp.lambdify(t, expresion, "numpy")
+        valores_tramo = evaluar_funcion(funcion_tramo, puntos_tramo)
+
+        color_tramo, estilo_tramo = colores_bloques.get(etiqueta, ("tab:blue", "-"))
+        mostrar_label = etiqueta if etiqueta not in etiquetas_usadas else None
+        etiquetas_usadas.add(etiqueta)
+
+        ax_forzada.plot(
+            puntos_tramo,
+            valores_tramo,
+            color=color_tramo,
+            linestyle=estilo_tramo,
+            linewidth=3.2,
+            label=mostrar_label,
+            zorder=4
+        )
+
+        # Marcar extremos de cada tramo con puntos para apreciar discontinuidades
+        ax_forzada.scatter(
+            [puntos_tramo[0], puntos_tramo[-1]],
+            [valores_tramo[0], valores_tramo[-1]],
+            color=color_tramo,
+            s=35,
+            zorder=5
+        )
+
+    # Sombrear la region de la senal original ingresada para identificarla de un vistazo
+    ax_forzada.axvspan(
+        float(t_min_ingresado),
+        float(t_max_ingresado),
+        color="#1f77b4",
+        alpha=0.10,
+        label=f"Intervalo original ingresado [{sp.sstr(t_min_ingresado)}, {sp.sstr(t_max_ingresado)}]"
+    )
+
+    # Lineas de referencia de simetria (ejes de reflexion, mitad y cuartos de onda)
+    ax_forzada.axhline(0, color="black", linewidth=1.1, alpha=0.75)
+    ax_forzada.axvline(
+        float(t_referencia),
+        color="black",
+        linewidth=1.6,
+        linestyle="--",
+        label=f"Eje principal t = {sp.sstr(t_referencia)}"
+    )
+
+    if opcion in [3, 4, 5]:
+        t_mitad_onda = simplificar(t_min + T / 2)
+        ax_forzada.axvline(
+            float(t_mitad_onda),
+            color="purple",
+            linewidth=1.4,
+            linestyle=":",
+            label=f"Mitad de periodo (T/2) t = {sp.sstr(t_mitad_onda)}"
+        )
+
+    if opcion in [4, 5]:
+        t_q1 = simplificar(t_min + T / 4)
+        t_q3 = simplificar(t_min + 3 * T / 4)
+        ax_forzada.axvline(
+            float(t_q1),
+            color="gray",
+            linewidth=1.2,
+            linestyle="-.",
+            label=f"Cuartos (T/4, 3T/4): t = {sp.sstr(t_q1)}, {sp.sstr(t_q3)}"
+        )
+        ax_forzada.axvline(float(t_q3), color="gray", linewidth=1.2, linestyle="-.")
+
+    ax_forzada.set_xlim(float(t_min), float(t_max))
+    ax_forzada.set_xlabel("t", fontsize=12)
+    ax_forzada.set_ylabel("f(t)", fontsize=12)
+    ax_forzada.set_title(
+        f"CONSTRUCCION DE LA SENAL FORZADA A SIMETRIA: {nombre_simetria.upper()}\n"
+        f"Senal base en [{sp.sstr(t_min_ingresado)}, {sp.sstr(t_max_ingresado)}]  →  "
+        f"Periodo completo forzado en [{sp.sstr(t_min)}, {sp.sstr(t_max)}] (T = {sp.sstr(T)})",
+        fontsize=13.5,
+        fontweight="bold",
+        pad=12
+    )
+    ax_forzada.grid(True, alpha=0.32)
+    ax_forzada.legend(loc="best", fontsize=9.5, framealpha=0.95)
+    ax_forzada.margins(y=0.15)
+
+    # 2. Panel inferior: Vista de 2 periodos completos + Serie de Fourier para apreciar la onda periodica
+    t_vista_min = float(t_min) - 0.5 * float(T)
+    t_vista_max = float(t_max) + 0.5 * float(T)
+
+    for k_per in [-1, 0, 1]:
+        desplazamiento_per = k_per * float(T)
+        for idx_tr, (expresion, a, b) in enumerate(tramos):
+            a_desp = float(a) + desplazamiento_per
+            b_desp = float(b) + desplazamiento_per
+            pts_base = np.linspace(float(a), float(b), 250)
+            pts_desp = pts_base + desplazamiento_per
+            fn_tr = sp.lambdify(t, expresion, "numpy")
+            val_tr = evaluar_funcion(fn_tr, pts_base)
+
+            ax_periodica.plot(
+                pts_desp,
+                val_tr,
+                color="tab:blue",
+                linewidth=2.4,
+                alpha=0.95 if k_per == 0 else 0.55,
+                label="Senal periodica forzada (2 periodos)" if (k_per == 0 and idx_tr == 0) else None
+            )
+
+    puntos_2p = np.linspace(t_vista_min, t_vista_max, 3000)
+    y_fourier_2p = evaluar_funcion(f_fourier, puntos_2p)
+    ax_periodica.plot(
+        puntos_2p,
+        y_fourier_2p,
+        color="tab:orange",
+        linestyle="--",
+        linewidth=1.9,
+        label=f"Serie de Fourier superpuesta (N = {N1})"
+    )
+
+    ax_periodica.axvline(float(t_min), color="black", linestyle="--", linewidth=1.2, alpha=0.7)
+    ax_periodica.axvline(float(t_max), color="black", linestyle="--", linewidth=1.2, alpha=0.7, label="Limites del periodo principal")
+    ax_periodica.axhline(0, color="black", linewidth=0.9, alpha=0.6)
+
+    ax_periodica.set_xlim(t_vista_min, t_vista_max)
+    ax_periodica.set_xlabel("t", fontsize=12)
+    ax_periodica.set_ylabel("f(t)", fontsize=12)
+    ax_periodica.set_title(
+        f"VISTA PERIODICA EXTENDIDA (2 PERIODOS COMPLETOS) Y CONVERGENCIA DE FOURIER ({nombre_simetria.upper()})",
+        fontsize=12.5,
+        fontweight="bold",
+        pad=10
+    )
+    ax_periodica.grid(True, alpha=0.32)
+    ax_periodica.legend(loc="best", fontsize=9.5, framealpha=0.95)
+    ax_periodica.margins(y=0.15)
+
+    fig_forzada.tight_layout()
+    plt.show()
+    plt.close(fig_forzada)
+
+
+# ==========================================================
+# BLOQUE 21. RESUMEN FINAL
+# ==========================================================
+
+print("\n==========================================")
+print("                  RESUMEN")
+print("==========================================")
+
+print("\nModo de analisis:")
+print(nombre_simetria)
+
+print("\nN1 - Fourier / grafica:")
+print(N1)
+
+# print("\nN2 - Dirichlet:")
+# print(N2)
+#
+# print("\nN3 - Parseval:")
+# print(N3)
+
+print("\nPeriodo T =")
+sp.pprint(T)
+
+print("\nFrecuencia angular w0 =")
+sp.pprint(w0)
+
+print("\nCentro del periodo =")
+sp.pprint(centro)
+
+print("\na0 =")
+sp.pprint(sp.simplify(a0))
+
+print("\nSerie de Fourier:")
+sp.pprint(sp.expand(serie_fourier), use_unicode=True)
+
+# print("\nEnergia exacta =")
+# sp.pprint(energia)
+#
+# print(f"\nParseval con {N3} armonicos =")
+# sp.pprint(parseval_N)
+#
+# if efectividad is not None:
+#     print("\nEfectividad de Parseval = ")
+#     print(f"{float(efectividad):.10f} %")
+
+print("\n✓ Modo de senal procesado: " + nombre_simetria)
+print("✓ Fourier calculado.")
+print("✓ Grafica de Fourier generada.")
+print("✓ Serie matematica mostrada en la grafica.")
+# print("✓ Parseval calculado con N3.")
+# print("✓ Dirichlet calculado con N2.")
+
+
+# ==========================================================
+# BLOQUE 22. APARTADO PARA ADJUNTAR IMAGEN Y RECONOCER SIMETRIA
+# ==========================================================
+
+while True:
+    analizar_img = input("\n¿Desea adjuntar una imagen para identificar su tipo de simetría? (s/n): ").strip().lower()
+    if analizar_img == "s":
+        ejecutar_reconocimiento_por_imagen()
+    else:
+        break
